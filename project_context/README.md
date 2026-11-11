@@ -1,6 +1,6 @@
-# MediCast Project Context: dataProcessing and Backend
+# MediCast Project Context: dataProcessing, Backend, and Frontend
 
-This document explains how the data-processing pipeline works, how the backend works, and exactly which data-processing output the backend uses.
+This document explains how the data-processing pipeline works, how the backend works, how the frontend consumes the backend, and exactly which data-processing output the backend uses.
 
 ## 1. Repository overview
 
@@ -8,7 +8,7 @@ This document explains how the data-processing pipeline works, how the backend w
 MediCast/
 ├── dataProcessing/     # Offline data cleaning, modelling, and model export
 ├── backend/            # FastAPI application
-├── frontend/           # Web UI (not covered here)
+├── frontend/           # React web UI (section 4)
 └── project_context/    # This documentation
 ```
 
@@ -188,7 +188,7 @@ Only complete state-months are used for the backend's automatic rainfall lookup.
 
 ## 3. Backend
 
-The backend is a FastAPI application under `backend/src/app/`.
+The backend is a FastAPI application under `backend/src/app/`. Hand-run SQL migrations for the PostgreSQL database live under `backend/migrations/` (see section 3.8).
 
 ### 3.1 Structure
 
@@ -430,9 +430,127 @@ Inventory endpoints are unchanged and use in-memory storage in `store.py`:
 
 The inventory resets when the backend restarts. Dengue calculations read `current_stock` from the request body; they do not read inventory storage directly.
 
+### 3.8 Database migrations
+
+The project's PostgreSQL database (`Medicast`) already exists and is managed in pgAdmin. `backend/migrations/` contains plain SQL migrations that are run by hand from pgAdmin's Query Tool. The backend has no migration runner and no database connection code, so the application does not read these tables yet.
+
+```text
+backend/migrations/
+├── 001_init.sql          # Initial schema: tables, indexes, seeds, updated_at triggers
+└── 001_init.down.sql     # Reverses 001_init.sql
+```
+
+`001_init.sql` creates, in order:
+
+| Table | Purpose |
+|---|---|
+| `hospitals` | Hospitals with `state`, optional `district`, and a unique `join_code` |
+| `diseases` | Disease reference table, seeded with `dengue` and `tb` |
+| `users` | Hospital staff with roles (`admin`/`staff`) and unique lowercased emails |
+| `medicines` | Per-hospital medicine stock lines; names unique per hospital ignoring case and outer spaces |
+| `stock_movements` | Append-only stock audit log (`old_quantity`, `new_quantity`, `change`, `reason`) |
+
+Details:
+
+- All foreign keys use `on delete restrict`.
+- Case-insensitive uniqueness uses indexes on `lower(...)`; medicine names per hospital use `lower(btrim(name))`.
+- All timestamps are `timestamptz` with `now()` defaults.
+- `stock_movements` has no `updated_at` column because rows are append-only; its `change` column is constrained to equal `new_quantity - old_quantity`.
+- A single `set_updated_at()` plpgsql function with `before update` triggers keeps `updated_at` current on `hospitals`, `users`, and `medicines`.
+- Only `dengue` and `tb` are seeded; no hospitals, users, or medicines are inserted.
+
+`001_init.down.sql` drops the three triggers, the function, and the five tables in reverse dependency order (`stock_movements`, `medicines`, `users`, `diseases`, `hospitals`). It drops nothing else.
+
+Both files wrap everything in a single transaction (`begin`/`commit`) and use plain `create table`/`drop` without `if not exists`/`if exists`, so running a file twice fails loudly instead of silently skipping.
+
+How to run:
+
+1. In pgAdmin, connect to the server and click the `Medicast` database in the tree to select it.
+2. Right-click the database and open **Query Tool**.
+3. Open `backend/migrations/001_init.sql` with the Query Tool's file-open button (or paste its contents) and execute (F5).
+4. Verify with `select * from diseases;` — it should return the two seeded rows.
+5. To undo everything, run `backend/migrations/001_init.down.sql` the same way.
+
+The same files can also be applied from the command line with `psql -d Medicast -f backend/migrations/001_init.sql`.
+
+dbmate (v2.35.0) is installed locally but is not used: these files do not follow dbmate's `<version>_<name>.up.sql` naming, no `DATABASE_URL` is configured, and dbmate would add its own `schema_migrations` tracking table. pgAdmin remains the intended workflow.
+
 ---
 
-## 4. End-to-end data flow
+## 4. Frontend
+
+The frontend is a React + Vite + TypeScript application under `frontend/src/`. It is a thin client: it reads inventory data, posts calculation requests, and renders the returned metrics. It contains no model or rainfall logic of its own.
+
+### 4.1 Structure
+
+```text
+frontend/src/
+├── api/
+│   └── inventory.ts         # Typed fetch client for all backend endpoints
+├── components/
+│   ├── NavBar.tsx           # Navigation bar (Dashboard, Inventory, Calculator)
+│   └── MedicineCard.tsx     # Stock card used by the dashboard
+├── pages/
+│   ├── DashboardPage.tsx    # Current stock levels (GET /api/inventory)
+│   ├── InventoryPage.tsx    # Add medicines and stock (POST /api/medicines, POST /api/inventory)
+│   └── CalculatorPage.tsx   # Calculation form and result card
+├── medicines.ts             # Static medicine list ("TB medicines", "Dengue medicines")
+├── App.tsx                  # Routes: /dashboard, /inventory, /calculator
+└── main.tsx                 # Entry point
+```
+
+### 4.2 API client
+
+All HTTP calls go through `frontend/src/api/inventory.ts`:
+
+| Function | Endpoint | Use |
+|---|---|---|
+| `getInventory()` | `GET /api/inventory` | Medicine list and stock levels |
+| `addMedicine()` | `POST /api/medicines` | Register a new medicine |
+| `addInventory()` | `POST /api/inventory` | Add stock for a medicine |
+| `sendCalculation()` | `POST /api/calculate` | Submit a calculation |
+
+The client uses a single `request()` helper. The backend base URL comes from the `VITE_API_BASE_URL` environment variable and defaults to `http://localhost:8000` (see `frontend/.env.example`).
+
+The `CalculationResponse` type mirrors the backend's `CalculationResult`. Every field except `status` is optional because non-dengue medicines return only a status.
+
+### 4.3 Calculator flow
+
+`CalculatorPage` works as follows:
+
+1. On mount, it loads the medicine list with `getInventory()` and fills the medicine dropdown.
+2. The form collects:
+   - medicine (dropdown)
+   - current stock (whole number, 0 or greater)
+   - average sold per year (positive whole number)
+   - days of stock to cover (positive whole number, defaults to 30)
+3. Inputs are validated client-side before submitting.
+4. On submit, it posts only `medicine`, `current_stock`, `yearly_sales`, and `days` to `POST /api/calculate`.
+5. The result card shows:
+   - a status badge (green for `Stock sufficient`, amber otherwise)
+   - target stock, shortfall, daily average, expected daily use, and seasonal factor
+   - the baseline source with underscores replaced by spaces
+   - a `Rainfall adjustment: applied/not applied` badge
+   - a `Capped` badge when the seasonal factor was clamped
+6. For non-dengue medicines, the backend returns only `{"status": "received"}`; the card then shows a plain "Request received" message with no calculation details.
+
+### 4.4 Current limitation
+
+The UI does not send `state`, `month`, or `rain_prev_departure`. Dengue calculations made from the web UI therefore:
+
+- use the current calendar month (the backend defaults `month` to today's month),
+- run without a state, so the baseline comes from the month-level fallback rather than a state-month entry,
+- never apply the rainfall adjustment (`adjustment_applied` is always `false`).
+
+State-aware baselines and the automatic rainfall lookup only take effect on direct API calls that include a `state`.
+
+### 4.5 CORS
+
+The backend enables `CORSMiddleware` in `main.py` with `allow_origins=["*"]`, so the Vite dev server (default `http://localhost:5173`) can call the API directly without a proxy.
+
+---
+
+## 5. End-to-end data flow
 
 ```text
 Raw dengue CSV ----------------------+
@@ -461,9 +579,13 @@ Raw daily rainfall CSV -------------+
                                      |
                                      v
                         POST /api/calculate
+                (request from CalculatorPage)
                                      |
                                      v
                        JSON calculation result
+                                     |
+                                     v
+                   CalculatorPage result card
 
 
 Raw 2026 rainfall CSV
@@ -484,6 +606,9 @@ backend/src/app/services/helpers/rain.py
         |
         v
 POST /api/calculate
+        |
+        v
+JSON result rendered in CalculatorPage
 ```
 
 In short:
@@ -492,3 +617,5 @@ In short:
 - The interfaces between data processing and the backend are the dengue model JSON and the latest rainfall JSON.
 - The backend performs lightweight lookups and arithmetic, with no data science libraries or runtime access to the raw data.
 - The rainfall lookup fills `rain_prev_departure` automatically when a state is provided and the request does not supply it.
+- The frontend is a thin client: it reads inventory, posts calculation requests, and renders the returned metrics, with no model or rainfall logic of its own.
+- `backend/migrations/` contains hand-run SQL migrations that prepare the PostgreSQL `Medicast` database (pgAdmin); the backend does not connect to it yet, and inventory still lives in the in-memory store.
