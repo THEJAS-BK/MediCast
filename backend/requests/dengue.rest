@@ -35,7 +35,7 @@ Content-Type: application/json
   "yearly_sales": 1200,
   "days": 30,
   "state": "Kerala",
-  "month": 11,
+  "month": 12,
   "rain_prev_departure": 0.3
 }
 
