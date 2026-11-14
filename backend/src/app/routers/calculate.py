@@ -27,3 +27,4 @@ def calculate_request(payload: CalculationRequest):
         month=month,
         rain_prev_departure=rain_prev_departure,
     )
+
