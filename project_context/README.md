@@ -24,6 +24,10 @@ The important boundary is:
 
 `dataProcessing/` contains the raw source data, notebooks for cleaning and training, and generated data/model files.
 
+For a deeper, task-oriented guide — how to run each notebook, add new dengue or rainfall data, retrain, and publish artifacts to the backend — see [`dataProcessing_README.md`](dataProcessing_README.md). This section remains the concise reference for what the pipeline produces.
+
+To add a second disease (for example TB) to the pipeline and backend, see [`add_disease_README.md`](add_disease_README.md).
+
 ### 2.1 Folder contents
 
 ```text
@@ -479,7 +483,7 @@ dbmate (v2.35.0) is installed locally but is not used: these files do not follow
 
 ## 4. Frontend
 
-The frontend is a React + Vite + TypeScript application under `frontend/src/`. It is a thin client: it reads inventory data, posts calculation requests, and renders the returned metrics. It contains no model or rainfall logic of its own.
+The frontend is a React + Vite + TypeScript application under `frontend/src/`. It is a thin client: it reads inventory data, posts calculation requests, and renders the returned metrics. It contains no model or rainfall logic of its own. Authentication and organization management are local-only dummy state (section 4.6).
 
 ### 4.1 Structure
 
@@ -488,15 +492,26 @@ frontend/src/
 ├── api/
 │   └── inventory.ts         # Typed fetch client for all backend endpoints
 ├── components/
-│   ├── NavBar.tsx           # Navigation bar (Dashboard, Inventory, Calculator)
+│   ├── NavBar.tsx           # Shared nav bar and profile dropdown
 │   └── MedicineCard.tsx     # Stock card used by the dashboard
+├── context/
+│   ├── auth.ts              # Auth context, user/organization/member types
+│   ├── AuthProvider.tsx     # Dummy auth, members, and localStorage persistence
+│   └── useAuth.ts           # Context hook
 ├── pages/
+│   ├── LandingPage.tsx      # Public hero page
+│   ├── LoginPage.tsx        # Login form
+│   ├── SignupPage.tsx       # Signup form
+│   ├── OrganizationPage.tsx # Create or join an organization
+│   ├── OrganizationInfoPage.tsx # Read-only organization and member view
 │   ├── DashboardPage.tsx    # Current stock levels (GET /api/inventory)
 │   ├── InventoryPage.tsx    # Add medicines and stock (POST /api/medicines, POST /api/inventory)
-│   └── CalculatorPage.tsx   # Calculation form and result card
+│   ├── CalculatorPage.tsx   # Calculation form and result card
+│   ├── ProfilePage.tsx      # Dummy profile details
+│   └── AdminPage.tsx        # Admin member management
 ├── medicines.ts             # Static medicine list ("TB medicines", "Dengue medicines")
-├── App.tsx                  # Routes: /dashboard, /inventory, /calculator
-└── main.tsx                 # Entry point
+├── App.tsx                  # Routes, guards, and authenticated layout
+└── main.tsx                 # Entry point and AuthProvider wrapper
 ```
 
 ### 4.2 API client
@@ -547,6 +562,71 @@ State-aware baselines and the automatic rainfall lookup only take effect on dire
 ### 4.5 CORS
 
 The backend enables `CORSMiddleware` in `main.py` with `allow_origins=["*"]`, so the Vite dev server (default `http://localhost:5173`) can call the API directly without a proxy.
+
+### 4.6 Authentication and organization flow (frontend only)
+
+Authentication is a frontend-only simulation. There is no backend auth, token, cookie, or password verification. Any input that passes the client-side checks succeeds.
+
+Routes and access rules:
+
+| Route | Access | Purpose |
+|---|---|---|
+| `/` | Public | Landing page with Login and Sign Up buttons |
+| `/login` | Public | Email and password form |
+| `/signup` | Public | Name, email, and password form |
+| `/organization` | Logged in | Choose Create Organization or Join Organization; NavBar is visible |
+| `/dashboard` | Logged in + organization | Existing dashboard page |
+| `/inventory` | Logged in + organization | Existing inventory page |
+| `/calculator` | Logged in + organization | Existing calculator page |
+| `/profile` | Logged in + organization | Dummy name, email, organization, and role |
+| `/organization-info` | Logged in + organization | Read-only organization details and member list |
+| `/admin` | Logged in + organization + admin role | Admin member management |
+
+Guards live in `App.tsx`:
+
+- `RequireAuth` redirects unauthenticated users to `/login`.
+- `AuthLayout` renders the shared NavBar and page container for every authenticated route, including `/organization`.
+- `RequireOrganization` redirects logged-in users without an organization to `/organization` for all organization-dependent pages.
+- `AdminOnly` redirects non-admins from `/admin` to `/dashboard`.
+
+The existing Dashboard, Inventory, and Calculator pages are unchanged; `AuthLayout` only wraps them with the shared NavBar and page container.
+
+Client-side validation:
+
+- Login requires a non-empty email and password.
+- Signup requires a non-empty name, a non-empty email, and a password.
+- Email must match a basic `name@domain.tld` pattern.
+- Password must be at least 8 characters.
+- Adding a member requires a non-empty name and a valid email.
+
+Auth state shape:
+
+```ts
+{
+  user: { name: string; email: string } | null
+  organization: { name: string; code: string } | null
+  role: 'admin' | 'member' | null
+  members: Array<{
+    id: string
+    name: string
+    email: string
+    role: 'admin' | 'member'
+  }>
+}
+```
+
+The state is persisted in `localStorage` under the key `medicast.auth` and is read when the app starts, so a refresh does not log the user out or lose member changes.
+
+Flow details:
+
+1. Login and signup set the dummy user, clear any previous organization/role/members, and navigate to `/organization`.
+2. Create Organization asks for a name, generates a code such as `ORG-4X7K2`, stores the organization, sets the current user's role to `admin`, seeds the members list with the current admin plus four dummy members, and shows the code before the user continues to `/dashboard`.
+3. Join Organization asks for a code. Any non-empty code is accepted; it is uppercased, stored as the organization code with the name `Organization <CODE>`, and the current user is added with the `member` role. The seeded member list includes one dummy admin plus three dummy members.
+4. The members list is stored in the same auth context and persisted with the rest of the state. Member changes are local only; no invites or emails are sent.
+5. Logout is available from the NavBar profile dropdown, removes the stored auth state, and navigates to `/`.
+6. The NavBar shows links to Dashboard, Inventory, and Calculate, highlights the active link, and opens a profile dropdown with Profile, Organization, Admin Panel (admins only), and Logout. The dropdown closes on an outside click or Escape.
+7. The admin panel shows the organization name and code, a members table, and an Add Member form. Removal requires a browser confirm, and the current admin's own Remove button is disabled. New members are added with the `member` role.
+8. `/organization-info` is read-only for all roles. Members see a Leave Organization button that clears the organization, role, and members list and redirects to `/organization`; admins do not see this button.
 
 ---
 
